@@ -24,15 +24,19 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"net/url"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/go-kit/kit/log"
+	"github.com/go-kit/kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/prometheus/common/log"
+	"github.com/prometheus/common/promlog"
+	"github.com/prometheus/common/promlog/flag"
 	"github.com/prometheus/common/version"
 	"gopkg.in/alecthomas/kingpin.v2"
 )
@@ -60,6 +64,7 @@ var (
 	frontendLabelNames = []string{"frontend"}
 	backendLabelNames  = []string{"backend"}
 	serverLabelNames   = []string{"backend", "server"}
+	logger             = log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr))
 )
 
 func newFrontendMetric(metricName string, docString string, constLabels prometheus.Labels) *prometheus.Desc {
@@ -312,7 +317,7 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) (up float64) {
 
 	body, err := e.fetch()
 	if err != nil {
-		log.Errorf("Can't scrape HAProxy: %v", err)
+		level.Error(logger).Log("msg", "Can't scrape HAProxy", "err", err)
 		return 0
 	}
 	defer body.Close()
@@ -330,11 +335,11 @@ loop:
 			break loop
 		default:
 			if _, ok := err.(*csv.ParseError); ok {
-				log.Errorf("Can't read CSV: %v", err)
+				level.Error(logger).Log("msg", "Can't read CSV", "err", err)
 				e.csvParseFailures.Inc()
 				continue loop
 			}
-			log.Errorf("Unexpected error while reading CSV: %v", err)
+			level.Error(logger).Log("msg", "Unexpected error while reading CSV", "err", err)
 			return 0
 		}
 		e.parseRow(row, ch)
@@ -344,7 +349,7 @@ loop:
 
 func (e *Exporter) parseRow(csvRow []string, ch chan<- prometheus.Metric) {
 	if len(csvRow) < minimumCsvFieldCount {
-		log.Errorf("Parser expected at least %d CSV fields, but got: %d", minimumCsvFieldCount, len(csvRow))
+		level.Error(logger).Log("msg", "Insufficient number of fields for parsing", "minExpected", minimumCsvFieldCount, "numFields", len(csvRow))
 		e.csvParseFailures.Inc()
 		return
 	}
@@ -404,7 +409,7 @@ func (e *Exporter) exportCsvFields(metrics map[int]*prometheus.Desc, csvRow []st
 			value = float64(valueInt)
 		}
 		if err != nil {
-			log.Errorf("Can't parse CSV field value %s: %v", valueStr, err)
+			level.Error(logger).Log("msg", "Unparsable CSV field value", "value", valueStr, "err", err)
 			e.csvParseFailures.Inc()
 			continue
 		}
@@ -457,22 +462,27 @@ func main() {
 		haProxyPidFile            = kingpin.Flag("haproxy.pid-file", pidFileHelpText).Default("").String()
 	)
 
-	log.AddFlags(kingpin.CommandLine)
+	promlogConfig := &promlog.Config{}
+	flag.AddFlags(kingpin.CommandLine, promlogConfig)
+	logger = promlog.New(promlogConfig)
+
 	kingpin.Version(version.Print("haproxy_exporter"))
 	kingpin.HelpFlag.Short('h')
 	kingpin.Parse()
 
 	selectedServerMetrics, err := filterServerMetrics(*haProxyServerMetricFields)
 	if err != nil {
-		log.Fatal(err)
+		level.Error(logger).Log("msg", "Unexpected fatal error encountered", "err", err)
+		os.Exit(1)
 	}
 
-	log.Infoln("Starting haproxy_exporter", version.Info())
-	log.Infoln("Build context", version.BuildContext())
+	level.Info(logger).Log("msg", "Starting haproxy_exporter", "version", version.Info())
+	level.Info(logger).Log("build_context", version.BuildContext())
 
 	exporter, err := NewExporter(*haProxyScrapeURI, *haProxySSLVerify, selectedServerMetrics, *haProxyTimeout)
 	if err != nil {
-		log.Fatal(err)
+		level.Error(logger).Log("msg", "Unexpected fatal error encountered", "err", err)
+		os.Exit(1)
 	}
 	prometheus.MustRegister(exporter)
 	prometheus.MustRegister(version.NewCollector("haproxy_exporter"))
@@ -495,7 +505,7 @@ func main() {
 		prometheus.MustRegister(procExporter)
 	}
 
-	log.Infoln("Listening on", *listenAddress)
+	level.Info(logger).Log("msg", "Listening", "address", *listenAddress)
 	http.Handle(*metricsPath, promhttp.Handler())
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`<html>
@@ -506,5 +516,6 @@ func main() {
              </body>
              </html>`))
 	})
-	log.Fatal(http.ListenAndServe(*listenAddress, nil))
+	level.Info(logger).Log("msg", http.ListenAndServe(*listenAddress, nil))
+	os.Exit(0)
 }
